@@ -1,0 +1,11 @@
+azure-ai-documentintelligence==1.0.0b4
+azure-storage-blob
+azure-search-documents
+openai
+python-dotenv
+fastapi
+uvicorn[standard]
+pydantic
+streamlit>=1.34
+azure-search-documents
+openai
