@@ -1,7 +1,9 @@
+from typing import List, Dict, Optional
+
 from azure.search.documents import SearchClient
-from openai import AzureOpenAI
-from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.models import VectorizedQuery
+from azure.core.credentials import AzureKeyCredential
+from openai import AzureOpenAI
 
 from src.config import (
     AZURE_SEARCH_ENDPOINT,
@@ -12,7 +14,7 @@ from src.config import (
     AZURE_OPENAI_CHAT_DEPLOYMENT,
     AZURE_OPENAI_EMBED_ENDPOINT,
     AZURE_OPENAI_EMBED_DEPLOYMENT,
-    openai_client
+    openai_client,
 )
 
 # ==========
@@ -38,7 +40,7 @@ aoai = AzureOpenAI(
 def embed_query(text: str):
     embedding = aoai.embeddings.create(
         input=text,
-        model=AZURE_OPENAI_EMBED_DEPLOYMENT
+        model=AZURE_OPENAI_EMBED_DEPLOYMENT,
     )
     return embedding.data[0].embedding
 
@@ -46,35 +48,27 @@ def embed_query(text: str):
 # ==========
 # Hybrid Vector Search
 # ==========
-def search_contracts(query: str, top_k: int = 5, filters: str = None):
-    print("\n=== DEBUG: Running search_contracts ===")
-    print("Query:", query)
-
+def search_contracts(
+    query: str,
+    top_k: int = 50,
+    filters: Optional[str] = None,
+    use_vectors: bool = True,
+):
     vector = embed_query(query)
-    print("Embedding dim:", len(vector))
-
     vector_query = VectorizedQuery(
         vector=vector,
         fields="embedding",
-        k_nearest_neighbors=top_k   
+        k_nearest_neighbors=top_k,
     )
 
-    print("Sending query to Azure Search…")
-
-    results = list(search_client.search(
-        search_text=query,            # keyword
-       # vector_queries=[vector_query], # vector
-        filter=filters,
-        top=top_k,        
-    ))
-
-    print("Results count:", len(results))
-    for r in results:
-        print("----")
-        print("ID:", r["id"])
-        print("Page:", r["page_number"])
-        print("Content snippet:", r["content"][:200])
-        print("Score:", r['@search.score'], 0.0)
+    results = list(
+        search_client.search(
+            search_text=query,
+            vector_queries=[vector_query] if use_vectors else None,
+            filter=filters,
+            top=top_k,
+        )
+    )
 
     return results
 
@@ -148,6 +142,81 @@ Now answer the user question strictly based on the above chunks.
     final_answer = response.choices[0].message.content
 
     # Append citations at the end
-    final_answer += "\n\nSOURCES:\n" + citation_text
+    #final_answer += "\n\nSOURCES:\n" + citation_text
 
     return final_answer
+
+
+def format_chat_history(chat_history: List[Dict[str, str]]) -> str:
+    """
+    Collapse the prior conversation into a compact text block for the model.
+    """
+    history_lines = []
+    for msg in chat_history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if not content:
+            continue
+        history_lines.append(f"{role.upper()}: {content}")
+    return "\n".join(history_lines)
+
+
+def answer_with_search(
+    question: str,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    top_k: int = 50,
+    filters: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    Run hybrid search and generate a grounded answer that respects chat history.
+    Returns a dict with the answer text and the raw search results.
+    """
+    results = search_contracts(question, top_k=top_k, filters=filters)
+    history_text = format_chat_history(chat_history or [])
+
+    if not results:
+        return {
+            "answer": "No relevant information was found in the indexed documents.",
+            "results": [],
+        }
+    print(results)
+    context_blocks = []
+    citation_blocks = []
+
+    for i, c in enumerate(results, start=1):
+        context_blocks.append(
+            f"[Chunk {i}] (page={c.get('page_number')}) (score={c['@search.score']:.3f})\n{c['content']}"
+        )
+        citation_blocks.append(
+            f"[{i}] {c.get('filename')} - Page {c.get('page_number')} - Chunk {c.get('id')} - Score {c['@search.score']:.3f}"
+        )
+
+    context_text = "\n\n".join(context_blocks)
+    citation_text = "\n".join(citation_blocks)
+
+    user_prompt = f"""
+User question:
+{question}
+
+Conversation so far (use only for context of the ask, not as a knowledge base):
+{history_text or 'N/A'}
+
+Here are the retrieved chunks. ONLY use information found inside them:
+
+{context_text}
+
+Now answer the user question strictly based on the above chunks.
+"""
+
+    response = openai_client.chat.completions.create(
+        model=AZURE_OPENAI_CHAT_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    final_answer = response.choices[0].message.content
+    final_answer += "\n\nSOURCES:\n" + citation_text
+
+    return {"answer": final_answer, "results": results}

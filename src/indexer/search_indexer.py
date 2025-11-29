@@ -1,29 +1,31 @@
-from typing import List, Dict
+from typing import Dict, List
+
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
-    SearchIndex,
-    SimpleField,
-    SearchableField,
-    SearchFieldDataType,
-    SearchField,
-    VectorSearch,
     HnswAlgorithmConfiguration,
+    SearchField,
+    SearchFieldDataType,
+    SearchIndex,
+    SearchableField,
+    SimpleField,
+    VectorSearch,
+    VectorSearchProfile,
 )
 from openai import AzureOpenAI
 
 from src.config import (
-    AZURE_SEARCH_ENDPOINT,
-    AZURE_SEARCH_API_KEY,
-    AZURE_SEARCH_INDEX_NAME,
-    AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_API_KEY,
-    AZURE_OPENAI_EMBED_DEPLOYMENT,
     AZURE_OPENAI_CHAT_DEPLOYMENT,
+    AZURE_OPENAI_EMBED_DEPLOYMENT,
     AZURE_OPENAI_EMBED_ENDPOINT,
+    AZURE_OPENAI_ENDPOINT,
+    AZURE_SEARCH_API_KEY,
+    AZURE_SEARCH_ENDPOINT,
+    AZURE_SEARCH_INDEX_NAME,
 )
-from src.config import openai_client, AZURE_OPENAI_CHAT_DEPLOYMENT
+from src.config import openai_client
 
 # -----------------------------
 # Azure clients
@@ -55,11 +57,12 @@ def create_index_if_not_exists(embedding_dim: int = 1536):
         print(f"Index '{AZURE_SEARCH_INDEX_NAME}' already exists.")
         return
 
-    print(f"Creating index '{AZURE_SEARCH_INDEX_NAME}'…")
+    print(f"Creating index '{AZURE_SEARCH_INDEX_NAME}'...")
 
     fields = [
         SimpleField(name="id", type=SearchFieldDataType.String, key=True),
         SearchableField(name="content", type=SearchFieldDataType.String),
+        SimpleField(name="filename", type=SearchFieldDataType.String, filterable=True),
         SimpleField(name="doc_id", type=SearchFieldDataType.String, filterable=True),
         SimpleField(name="page_number", type=SearchFieldDataType.Int32, filterable=True),
         SearchableField(name="section_title", type=SearchFieldDataType.String),
@@ -67,10 +70,8 @@ def create_index_if_not_exists(embedding_dim: int = 1536):
             name="tags",
             type=SearchFieldDataType.Collection(SearchFieldDataType.String),
             filterable=True,
-            facetable=True
+            facetable=True,
         ),
-
-        # Contract metadata
         SimpleField(name="contract_id", type=SearchFieldDataType.String, filterable=True),
         SimpleField(name="tenant_name", type=SearchFieldDataType.String, filterable=True),
         SimpleField(name="owner_name", type=SearchFieldDataType.String, filterable=True),
@@ -80,31 +81,28 @@ def create_index_if_not_exists(embedding_dim: int = 1536):
         SimpleField(name="rent_per_sqft", type=SearchFieldDataType.Double, filterable=True),
         SimpleField(name="start_date", type=SearchFieldDataType.String, filterable=True),
         SimpleField(name="end_date", type=SearchFieldDataType.String, filterable=True),
-
-        # VECTOR FIELD — FINAL FIX
         SearchField(
             name="embedding",
             type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
             searchable=True,
             vector_search_dimensions=embedding_dim,
-            vector_search_profile_name="my-vector-profile",   # <── REQUIRED FIX
+            vector_search_profile_name="my-vector-profile",
         ),
     ]
 
-    # Matching vector search config
     vector_search = VectorSearch(
         algorithms=[
             HnswAlgorithmConfiguration(
                 name="my-hnsw-config",
-                kind="hnsw"
+                kind="hnsw",
             )
         ],
         profiles=[
-            {
-                "name": "my-vector-profile",       # <── Profile name
-                "algorithm": "my-hnsw-config"      # <── Algorithm must match
-            }
-        ]
+            VectorSearchProfile(
+                name="my-vector-profile",
+                algorithm_configuration_name="my-hnsw-config",
+            )
+        ],
     )
 
     index = SearchIndex(
@@ -141,13 +139,13 @@ def index_chunks(chunks: List[Dict]):
         content = ch["content"]
         entities = ch.get("entities") or {}
 
-        # Compute embedding
         vec = embed_text(content)
 
         doc = {
             "id": ch["id"],
             "content": content,
             "doc_id": ch["doc_id"],
+            "filename": ch.get("source_file") or entities.get("source_file"),
             "page_number": ch.get("page_number", None),
             "section_title": ch["section_title"],
             "tags": ch.get("tags", []),
@@ -168,7 +166,7 @@ def index_chunks(chunks: List[Dict]):
         print("No docs to index.")
         return
 
-    print(f"Uploading {len(docs)} documents to Azure Search…")
+    print(f"Uploading {len(docs)} documents to Azure Search...")
     result = search_client.upload_documents(docs)
     failed = [r for r in result if not r.succeeded]
     if failed:
@@ -179,74 +177,50 @@ def index_chunks(chunks: List[Dict]):
 
 def delete_all_documents():
     """Deletes all documents in the Azure Cognitive Search index."""
-    print("🗑 Deleting all documents from Azure Search...")
+    print("Deleting all documents from Azure Search...")
 
     try:
-        # Query all documents
         results = search_client.search(search_text="*", top=1000)
         ids = [d["id"] for d in results]
 
         if not ids:
-            print("✔ Index already empty.")
+            print("Index already empty.")
             return
 
-        # Build deletion payload
         actions = [{"@search.action": "delete", "id": _id} for _id in ids]
 
-        # Push delete request
         search_client.upload_documents(actions)
-        print(f"✔ Deleted {len(ids)} documents from index.")
+        print(f"Deleted {len(ids)} documents from index.")
 
     except Exception as e:
-        print("❌ Error flushing index:", e)
+        print("Error flushing index:", e)
 
 
-    def generate_final_answer(query, chunks):
-        # Build context text
-        context = "\n\n".join(
-            f"[Chunk {i+1}] (score={c['score']:.3f}) {c['content']}"
-            for i, c in enumerate(chunks)
-        )
+def delete_documents_by_doc_id(doc_id: str):
+    """
+    Delete all documents associated with a single doc_id.
+    """
+    results = search_client.search(
+        search_text="*",
+        filter=f"doc_id eq '{doc_id}'",
+        top=1000,
+    )
+    ids = [d["id"] for d in results]
+    if not ids:
+        return
 
-        # Build citation metadata separately
-        citations = []
-        for i, c in enumerate(chunks, start=1):
-            citations.append(
-                f"[{i}] {c.get('filename', 'unknown-file')} "
-                f"— chunk {c.get('id')} — score {c['score']:.3f}"
-            )
+    actions = [{"@search.action": "delete", "id": _id} for _id in ids]
+    search_client.upload_documents(actions)
 
-        citation_text = "\n".join(citations)
 
-        # LLM prompt
-        prompt = f"""
-                You are a UAE commercial lease expert.
-
-                Use ONLY the provided contract chunks to answer the user's question.
-
-                User Question:
-                {query}
-
-                Context Chunks:
-                {context}
-
-                After answering, include a "SOURCES:" section listing which chunks you used.
-                Use this exact format:
-
-                SOURCES:
-                [number] filename — chunk id — score
-
-                Now provide the best possible answer.
-            """
-
-        response = openai_client.chat.completions.create(
-            model=AZURE_OPENAI_CHAT_DEPLOYMENT,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        final_answer = response.choices[0].message.content
-
-        # Append sources at bottom
-        final_answer += "\n\nSOURCES:\n" + citation_text
-
-        return final_answer
+def count_chunks_for_doc(doc_id: str) -> int:
+    """
+    Return total chunks indexed for the given doc_id.
+    """
+    result = search_client.search(
+        search_text="*",
+        filter=f"doc_id eq '{doc_id}'",
+        include_total_count=True,
+        top=1,
+    )
+    return int(result.get_count() or 0)

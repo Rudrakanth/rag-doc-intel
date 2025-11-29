@@ -1,5 +1,5 @@
-from src.query.search_query import generate_answer
+from src.query.search_query import answer_with_search
 
 q = "What are set off clauses?"
-answer = generate_answer(q)
-print("\nANSWER:\n", answer)
+result = answer_with_search(q)
+print("\nANSWER:\n", result["answer"])
